@@ -13,6 +13,7 @@ import torch
 
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
+from vllm.moe_activation_trace import MoeActivationTraceWindow
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -208,6 +209,7 @@ class EngineCoreOutput(
     prefill_stats: PrefillStats | None = None
 
     routed_experts: np.ndarray | None = None
+    moe_activation_trace: list[MoeActivationTraceWindow] | None = None
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0

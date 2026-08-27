@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.moe_activation_trace import MoeActivationTraceWindow
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -178,6 +179,7 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
+        self.moe_activation_trace: list[MoeActivationTraceWindow] = []
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -416,6 +418,9 @@ class RequestState:
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
+            moe_activation_trace=(
+                self.moe_activation_trace if self.moe_activation_trace else None
+            ),
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -638,6 +643,10 @@ class OutputProcessor:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
                 )
+            if engine_core_output.moe_activation_trace:
+                req_state.moe_activation_trace.extend(
+                    engine_core_output.moe_activation_trace
+                )
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
@@ -682,6 +691,7 @@ class OutputProcessor:
                 else:
                     # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
+                req_state.moe_activation_trace = []
 
             # Free completed requests.
             if finish_reason is not None:

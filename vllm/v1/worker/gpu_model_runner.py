@@ -62,7 +62,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    WindowRoutedExpertsCapturer,
     bind_routed_experts_capturer,
+    bind_window_routed_experts_capturer,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -99,6 +101,10 @@ from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
     set_offloader,
+)
+from vllm.moe_activation_trace import (
+    MoeActivationTraceWindow,
+    filter_generation_rows,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -538,6 +544,11 @@ class GPUModelRunner(
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
+        self.moe_activation_trace_initialized = False
+        self._moe_target_snapshot: dict[str, Any] | None = None
+        self._moe_mtp_snapshot: dict[str, Any] | None = None
+        self._moe_window_ids: defaultdict[str, int] = defaultdict(int)
+        self._moe_scheduler_step = 0
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -1245,6 +1256,7 @@ class GPUModelRunner(
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._moe_window_ids.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -4514,6 +4526,11 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        moe_trace_start = moe_trace_end = None
+        if self.moe_activation_trace_initialized:
+            moe_trace_start = torch.cuda.Event(enable_timing=True)
+            moe_trace_end = torch.cuda.Event(enable_timing=True)
+            moe_trace_start.record()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4539,6 +4556,37 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if moe_trace_end is not None:
+            moe_trace_end.record()
+            num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs].copy()
+            prompt_lens = self.input_batch.num_prompt_tokens[:num_reqs].copy()
+            target_token_ids: list[np.ndarray] = []
+            target_positions: list[np.ndarray] = []
+            for req_idx, count in enumerate(num_scheduled_tokens_np):
+                start = int(num_computed[req_idx])
+                end = start + int(count)
+                target_token_ids.append(
+                    self.input_batch.token_ids_cpu[req_idx, start:end].copy()
+                )
+                target_positions.append(np.arange(start, end, dtype=np.int64))
+            self._moe_target_snapshot = {
+                "request_ids": self.input_batch.req_ids.copy(),
+                "expert_ids": self.moe_target_capturer.snapshot(num_tokens_unpadded),
+                "token_ids": target_token_ids,
+                "positions": target_positions,
+                "query_lens": num_scheduled_tokens_np.tolist(),
+                "prompt_lens": prompt_lens.tolist(),
+                "start_event": moe_trace_start,
+                "end_event": moe_trace_end,
+                "batch_size": num_reqs,
+                "total_batch_tokens": num_tokens_unpadded,
+                "max_sequence_length": int(
+                    self.optimistic_seq_lens_cpu[:num_reqs].max().item()
+                ),
+                "scheduler_step": self._moe_scheduler_step,
+            }
+            self._moe_scheduler_step += 1
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4848,6 +4896,7 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        moe_activation_trace = self._consume_moe_activation_trace()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -4863,6 +4912,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                moe_activation_trace=moe_activation_trace,
             )
 
         if not self.use_async_scheduling:
@@ -5362,6 +5412,8 @@ class GPUModelRunner(
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+            if self.moe_activation_trace_initialized:
+                self._moe_mtp_snapshot = self.drafter.take_moe_activation_snapshot()
 
         return draft_token_ids
 
@@ -7768,6 +7820,121 @@ class GPUModelRunner(
             slot_mapping=self.routed_experts_slot_mapping_device[:num_tokens].clone(),
         )
 
+    def _consume_moe_activation_trace(
+        self,
+    ) -> dict[str, list[MoeActivationTraceWindow]] | None:
+        target = self._moe_target_snapshot
+        if not self.moe_activation_trace_initialized or target is None:
+            return None
+
+        target["end_event"].synchronize()
+        target_latency = float(target["start_event"].elapsed_time(target["end_event"]))
+        target_experts = target["expert_ids"].cpu().numpy().astype(np.int16)
+        target_infos = self.moe_target_capturer.layer_infos
+        target_layer_names = tuple(info.layer_name for info in target_infos)
+        target_layer_indices = tuple(info.layer_id for info in target_infos)
+        speculative_length = int(self.num_spec_tokens)
+
+        traces: dict[str, list[MoeActivationTraceWindow]] = defaultdict(list)
+        window_ids: dict[str, int] = {}
+        verification_lengths: dict[str, int] = {}
+        offset = 0
+        for req_idx, req_id in enumerate(target["request_ids"]):
+            query_len = int(target["query_lens"][req_idx])
+            positions = target["positions"][req_idx]
+            token_ids = target["token_ids"][req_idx]
+            prompt_len = int(target["prompt_lens"][req_idx])
+            experts, gen_token_ids, gen_positions = filter_generation_rows(
+                target_experts[offset : offset + query_len],
+                token_ids,
+                positions,
+                prompt_len,
+            )
+            if len(gen_positions):
+                window_id = self._moe_window_ids[req_id]
+                self._moe_window_ids[req_id] += 1
+                window_ids[req_id] = window_id
+                verification_lengths[req_id] = len(gen_positions)
+                traces[req_id].append(
+                    MoeActivationTraceWindow(
+                        schema_version=1,
+                        request_id=req_id,
+                        phase="backbone_verification",
+                        window_id=window_id,
+                        scheduler_step=int(target["scheduler_step"]),
+                        token_ids=gen_token_ids.astype(np.int32, copy=False),
+                        positions=gen_positions.astype(np.int64, copy=False),
+                        expert_ids=experts,
+                        layer_names=target_layer_names,
+                        layer_indices=target_layer_indices,
+                        window_token_count=len(gen_positions),
+                        preceding_verification_token_count=None,
+                        latency_ms=target_latency,
+                        batch_size=int(target["batch_size"]),
+                        total_batch_tokens=int(target["total_batch_tokens"]),
+                        max_sequence_length=int(target["max_sequence_length"]),
+                        speculative_length=speculative_length,
+                    )
+                )
+            offset += query_len
+
+        mtp = self._moe_mtp_snapshot
+        if mtp is not None:
+            mtp["end_event"].synchronize()
+            mtp_latency = float(mtp["start_event"].elapsed_time(mtp["end_event"]))
+            mtp_experts = mtp["expert_ids"].cpu().numpy().astype(np.int16)
+            mtp_token_ids = mtp["token_ids"].cpu().numpy()
+            mtp_positions = mtp["positions"].cpu().numpy()
+            rejected = mtp["num_rejected"].cpu().numpy()
+            mtp_infos = self.moe_mtp_capturer.layer_infos
+            mtp_layer_names = tuple(info.layer_name for info in mtp_infos)
+            mtp_layer_indices = tuple(info.layer_id for info in mtp_infos)
+            mtp_total_tokens = sum(map(int, mtp["query_lens"]))
+            offset = 0
+            for req_idx, req_id in enumerate(target["request_ids"]):
+                query_len = int(mtp["query_lens"][req_idx])
+                valid_len = max(0, query_len - int(rejected[req_idx]))
+                prompt_len = int(target["prompt_lens"][req_idx])
+                experts, gen_token_ids, gen_positions = filter_generation_rows(
+                    mtp_experts[offset : offset + valid_len],
+                    mtp_token_ids[offset : offset + valid_len],
+                    mtp_positions[offset : offset + valid_len],
+                    prompt_len,
+                )
+                if len(gen_positions):
+                    window_id = window_ids.get(req_id)
+                    if window_id is None:
+                        window_id = self._moe_window_ids[req_id]
+                        self._moe_window_ids[req_id] += 1
+                    traces[req_id].append(
+                        MoeActivationTraceWindow(
+                            schema_version=1,
+                            request_id=req_id,
+                            phase="mtp_first_pass",
+                            window_id=window_id,
+                            scheduler_step=int(target["scheduler_step"]),
+                            token_ids=gen_token_ids.astype(np.int32, copy=False),
+                            positions=gen_positions.astype(np.int64, copy=False),
+                            expert_ids=experts,
+                            layer_names=mtp_layer_names,
+                            layer_indices=mtp_layer_indices,
+                            window_token_count=len(gen_positions),
+                            preceding_verification_token_count=(
+                                verification_lengths.get(req_id, 0)
+                            ),
+                            latency_ms=mtp_latency,
+                            batch_size=int(target["batch_size"]),
+                            total_batch_tokens=mtp_total_tokens,
+                            max_sequence_length=int(mtp["max_sequence_length"]),
+                            speculative_length=speculative_length,
+                        )
+                    )
+                offset += query_len
+
+        self._moe_target_snapshot = None
+        self._moe_mtp_snapshot = None
+        return dict(traces) or None
+
     def init_routed_experts_capturer(self):
         logger.info(
             "Initializing routed experts capturer, enable_return_routed_experts: %s",
@@ -7809,6 +7976,44 @@ class GPUModelRunner(
             device=self.device,
         )
         self.routed_experts_initialized = True
+
+    def init_moe_activation_trace(self) -> None:
+        """Bind dense target and MTP route buffers after model loading."""
+        if self.speculative_config is None or self.speculative_config.method != "mtp":
+            raise ValueError(
+                "MoE activation tracing currently requires MTP speculative decoding."
+            )
+        if not isinstance(self.drafter, EagleProposer):
+            raise ValueError(
+                "MoE activation tracing requires the V1 EagleProposer MTP path."
+            )
+        top_k = self.model_config.get_num_experts_per_tok()
+        if top_k <= 0:
+            raise ValueError("MoE activation tracing requires routed experts.")
+
+        self.moe_target_capturer: WindowRoutedExpertsCapturer = (
+            bind_window_routed_experts_capturer(
+                self.model,
+                self.scheduler_config.max_num_batched_tokens,
+                top_k,
+                self.device,
+            )
+        )
+        self.moe_mtp_capturer: WindowRoutedExpertsCapturer = (
+            bind_window_routed_experts_capturer(
+                self.drafter.model,
+                self.scheduler_config.max_num_batched_tokens,
+                top_k,
+                self.device,
+            )
+        )
+        self.drafter.set_moe_activation_capturer(self.moe_mtp_capturer)
+        self.moe_activation_trace_initialized = True
+        logger.info(
+            "MoE activation trace initialized with %d target layers and %d MTP layers.",
+            len(self.moe_target_capturer.layer_infos),
+            len(self.moe_mtp_capturer.layer_infos),
+        )
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

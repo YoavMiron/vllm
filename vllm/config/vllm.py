@@ -1055,6 +1055,52 @@ class VllmConfig:
                     "connectors (PD disaggregation, KV cache offload)."
                 )
 
+        if (
+            self.model_config is not None
+            and self.model_config.enable_moe_activation_trace
+        ):
+            if self.model_config.enable_return_routed_experts:
+                raise ValueError(
+                    "--enable-moe-activation-trace and "
+                    "--enable-return-routed-experts are mutually exclusive."
+                )
+            if (
+                self.speculative_config is None
+                or self.speculative_config.method != "mtp"
+            ):
+                raise ValueError(
+                    "--enable-moe-activation-trace requires MTP speculative decoding."
+                )
+            if self.use_v2_model_runner:
+                raise ValueError(
+                    "--enable-moe-activation-trace currently requires the V1 "
+                    "GPU model runner. Set VLLM_USE_V2_MODEL_RUNNER=0."
+                )
+            if self.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "--enable-moe-activation-trace requires pipeline parallel size 1."
+                )
+            if self.parallel_config.data_parallel_size != 1:
+                raise ValueError(
+                    "--enable-moe-activation-trace requires data parallel size 1."
+                )
+            if self.parallel_config.enable_eplb:
+                raise ValueError(
+                    "--enable-moe-activation-trace requires EPLB to be disabled."
+                )
+            if self.scheduler_config.async_scheduling:
+                raise ValueError(
+                    "--enable-moe-activation-trace requires async scheduling "
+                    "to be disabled."
+                )
+            if (
+                self.kv_transfer_config is not None
+                and self.kv_transfer_config.is_kv_transfer_instance
+            ):
+                raise ValueError(
+                    "--enable-moe-activation-trace is incompatible with KV connectors."
+                )
+
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 

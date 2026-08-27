@@ -13,7 +13,9 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RoutedExpertsLayerInfo,
     RoutedExpertsManager,
+    WindowRoutedExpertsCapturer,
     bind_routed_experts_capturer,
     get_routed_experts_attn_gid,
 )
@@ -30,6 +32,25 @@ from vllm.v1.kv_cache_interface import (
 pytestmark = pytest.mark.cpu_test
 
 _REC_MODULE = "vllm.model_executor.layers.fused_moe.routed_experts_capturer"
+
+
+def test_window_capturers_keep_dense_target_and_mtp_buffers_separate():
+    target_infos = tuple(
+        RoutedExpertsLayerInfo(index, index * 2 + 1, f"model.layers.{index}.mixer")
+        for index in range(23)
+    )
+    mtp_infos = (RoutedExpertsLayerInfo(0, 0, "mtp.layers.0.mixer"),)
+    target = WindowRoutedExpertsCapturer(4, target_infos, 6, "cpu")
+    mtp = WindowRoutedExpertsCapturer(4, mtp_infos, 6, "cpu")
+
+    target_ids = torch.arange(12, dtype=torch.int32).reshape(2, 6)
+    mtp_ids = torch.arange(12, 24, dtype=torch.int32).reshape(2, 6)
+    target.capture(7, target_ids)
+    mtp.capture(0, mtp_ids)
+
+    assert target.snapshot(2).shape == (2, 23, 6)
+    assert torch.equal(target.snapshot(2)[:, 7], target_ids)
+    assert torch.equal(mtp.snapshot(2)[:, 0], mtp_ids)
 
 
 def _capturer_with_buffer(
@@ -96,8 +117,8 @@ def _make_model_config(hf_config):
         ),
     )
     model_config.get_num_experts = lambda: hf_config.num_experts
-    model_config.get_num_experts_per_tok = lambda: (
-        ModelConfig.get_num_experts_per_tok(model_config)
+    model_config.get_num_experts_per_tok = lambda: ModelConfig.get_num_experts_per_tok(
+        model_config
     )
     model_config.get_total_num_hidden_layers = lambda: hf_config.num_hidden_layers
     return model_config

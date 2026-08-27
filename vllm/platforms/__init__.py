@@ -19,6 +19,11 @@ def vllm_version_matches_substr(substr: str) -> bool:
     """
     Check to see if the vLLM version matches a substring.
     """
+    if os.getenv("MOE_TRACE_USE_SOURCE_VLLM_VERSION") == "1":
+        from vllm import __version__
+
+        return substr in __version__
+
     from importlib.metadata import PackageNotFoundError, version
 
     try:

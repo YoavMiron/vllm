@@ -1888,8 +1888,17 @@ class Scheduler(SchedulerInterface):
                         # Normal decode / re-prefill: token(s) at the END.
                         routed_experts = routing_data[end - len(new_token_ids) : end]
 
+            moe_activation_trace = None
+            if model_runner_output.moe_activation_trace is not None:
+                moe_activation_trace = model_runner_output.moe_activation_trace.get(
+                    req_id
+                )
+
             should_emit_output = bool(
-                new_token_ids or pooler_output is not None or stopped
+                new_token_ids
+                or pooler_output is not None
+                or stopped
+                or moe_activation_trace
             )
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
@@ -1942,6 +1951,7 @@ class Scheduler(SchedulerInterface):
                         ec_transfer_params=ec_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
+                        moe_activation_trace=moe_activation_trace,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

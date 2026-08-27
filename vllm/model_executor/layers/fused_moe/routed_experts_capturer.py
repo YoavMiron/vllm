@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -18,6 +19,129 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.outputs import RoutedExpertsTensors
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RoutedExpertsLayerInfo:
+    """Stable metadata for a routed layer in a dense trace buffer."""
+
+    ordinal: int
+    layer_id: int
+    layer_name: str
+
+
+class WindowRoutedExpertsCapturer:
+    """Dense, per-forward routed-expert capture for research traces.
+
+    Unlike :class:`RoutedExpertsCapturer`, this buffer is indexed only by
+    actual MoE layers and is not tied to KV-cache slots. Trace mode currently
+    requires DP=1, so token rows are already local and contiguous.
+    """
+
+    def __init__(
+        self,
+        max_num_batched_tokens: int,
+        layer_infos: tuple[RoutedExpertsLayerInfo, ...],
+        num_experts_per_tok: int,
+        device: torch.device | str | None = None,
+    ) -> None:
+        if not layer_infos:
+            raise ValueError("MoE activation tracing found no routed layers.")
+        if num_experts_per_tok <= 0:
+            raise ValueError("num_experts_per_tok must be positive.")
+        self.layer_infos = layer_infos
+        self.device_buffer = torch.zeros(
+            (
+                max_num_batched_tokens,
+                len(layer_infos),
+                num_experts_per_tok,
+            ),
+            dtype=torch.int32,
+            device=device or current_platform.device_type,
+        )
+
+    def capture(self, layer_ordinal: int, topk_ids: torch.Tensor) -> None:
+        if topk_ids.shape[1] != self.device_buffer.shape[2]:
+            raise ValueError(
+                "Unexpected experts-per-token dimension: "
+                f"{topk_ids.shape[1]} != {self.device_buffer.shape[2]}"
+            )
+        num_tokens = topk_ids.shape[0]
+        if num_tokens > self.device_buffer.shape[0]:
+            raise ValueError(
+                f"Trace received {num_tokens} tokens, buffer holds "
+                f"{self.device_buffer.shape[0]}."
+            )
+        self.device_buffer[:num_tokens, layer_ordinal, :] = topk_ids
+
+    def snapshot(self, num_tokens: int) -> torch.Tensor:
+        """Clone active rows before a later forward can overwrite them."""
+        return self.device_buffer[:num_tokens].clone()
+
+
+def bind_window_routed_experts_capturer(
+    model: torch.nn.Module,
+    max_num_batched_tokens: int,
+    num_experts_per_tok: int,
+    device: torch.device | str | None = None,
+) -> WindowRoutedExpertsCapturer:
+    """Discover routed layers, allocate a dense buffer, and bind callbacks."""
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+
+    modules = sorted(
+        (module for module in model.modules() if isinstance(module, MoERunner)),
+        key=lambda module: (module.layer_id, module.layer_name),
+    )
+    infos = tuple(
+        RoutedExpertsLayerInfo(
+            ordinal=ordinal,
+            layer_id=module.layer_id,
+            layer_name=module.layer_name,
+        )
+        for ordinal, module in enumerate(modules)
+    )
+    capturer = WindowRoutedExpertsCapturer(
+        max_num_batched_tokens,
+        infos,
+        num_experts_per_tok,
+        device,
+    )
+
+    for info, module in zip(infos, modules, strict=True):
+
+        def capture_fn(
+            topk_ids: torch.Tensor,
+            layer_ordinal: int = info.ordinal,
+            capturer: WindowRoutedExpertsCapturer = capturer,
+        ) -> None:
+            capturer.capture(layer_ordinal, topk_ids)
+
+        quant_method = module._quant_method
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        impl = getattr(moe_kernel, "impl", None)
+        fused_experts = getattr(impl, "fused_experts", None)
+        if quant_method.is_monolithic:
+            if not (
+                isinstance(fused_experts, FusedMoEExpertsMonolithic)
+                and fused_experts.supports_routing_replay_capture()
+            ):
+                raise ValueError(
+                    "MoE activation tracing is not supported with monolithic "
+                    f"kernel {type(fused_experts).__name__}."
+                )
+            fused_experts.set_capture_fn(capture_fn)
+        elif isinstance(module.router, BaseRouter):
+            module.router.set_capture_fn(capture_fn)
+        else:
+            raise ValueError(
+                "MoE activation tracing is not supported with router "
+                f"{type(module.router).__name__}."
+            )
+    return capturer
 
 
 def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.moe_activation_trace import MoeActivationTraceWindow
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -306,6 +307,9 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    # Generation-only target/MTP MoE windows, already split by request.
+    moe_activation_trace: dict[str, list[MoeActivationTraceWindow]] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

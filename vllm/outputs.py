@@ -13,6 +13,7 @@ from typing_extensions import TypeVar
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.moe_activation_trace import MoeActivationTraceWindow
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -43,6 +44,7 @@ class CompletionOutput:
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    moe_activation_trace: list[MoeActivationTraceWindow] | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
@@ -56,6 +58,7 @@ class CompletionOutput:
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
             f"routed_experts={self.routed_experts}, "
+            f"moe_activation_trace={self.moe_activation_trace}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "

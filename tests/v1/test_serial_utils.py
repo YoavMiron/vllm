@@ -8,6 +8,10 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.moe_activation_trace import (
+    MoeActivationTraceWindow,
+    filter_generation_rows,
+)
 from vllm.multimodal.inputs import (
     MultiModalBatchedField,
     MultiModalFieldElem,
@@ -20,6 +24,56 @@ from vllm.multimodal.inputs import (
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_moe_trace_filters_prefill_from_mixed_packed_window():
+    experts = np.arange(4 * 6).reshape(4, 1, 6)
+    token_ids = np.array([10, 11, 12, 13])
+    positions = np.array([3, 4, 5, 6])
+    actual_experts, actual_tokens, actual_positions = filter_generation_rows(
+        experts, token_ids, positions, prompt_length=5
+    )
+    assert np.array_equal(actual_experts, experts[2:])
+    assert actual_tokens.tolist() == [12, 13]
+    assert actual_positions.tolist() == [5, 6]
+
+
+def test_moe_activation_trace_engine_output_round_trip():
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+
+    trace = MoeActivationTraceWindow(
+        schema_version=1,
+        request_id="request",
+        phase="mtp_first_pass",
+        window_id=2,
+        scheduler_step=7,
+        token_ids=np.array([3, 4], dtype=np.int32),
+        positions=np.array([10, 11], dtype=np.int64),
+        expert_ids=np.arange(12, dtype=np.int16).reshape(2, 1, 6),
+        layer_names=("mtp.layers.0.mixer",),
+        layer_indices=(0,),
+        window_token_count=2,
+        preceding_verification_token_count=3,
+        latency_ms=0.5,
+        batch_size=1,
+        total_batch_tokens=2,
+        max_sequence_length=12,
+        speculative_length=3,
+    )
+    outputs = EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(
+                request_id="request",
+                new_token_ids=[4],
+                moe_activation_trace=[trace],
+            )
+        ]
+    )
+
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(MsgpackEncoder().encode(outputs))
+    actual = decoded.outputs[0].moe_activation_trace[0]
+    assert actual.layer_names == trace.layer_names
+    assert np.array_equal(actual.expert_ids, trace.expert_ids)
 
 
 class UnrecognizedType(UserDict):

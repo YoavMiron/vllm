@@ -667,6 +667,8 @@ class Worker(WorkerBase):
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
+        if self.model_config.enable_moe_activation_trace:
+            self.model_runner.init_moe_activation_trace()
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch

@@ -254,6 +254,8 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        self._moe_activation_capturer = None
+        self._moe_activation_snapshot: dict[str, Any] | None = None
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions, dtype=torch.int64, device=device
@@ -502,6 +504,14 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def set_moe_activation_capturer(self, capturer: Any) -> None:
+        self._moe_activation_capturer = capturer
+
+    def take_moe_activation_snapshot(self) -> dict[str, Any] | None:
+        snapshot = self._moe_activation_snapshot
+        self._moe_activation_snapshot = None
+        return snapshot
+
     def propose(
         self,
         num_speculative_tokens,
@@ -580,6 +590,12 @@ class SpecDecodeBaseProposer:
                 num_tokens,
             )
 
+        trace_start = trace_end = None
+        if self._moe_activation_capturer is not None:
+            trace_start = torch.cuda.Event(enable_timing=True)
+            trace_end = torch.cuda.Event(enable_timing=True)
+            trace_start.record()
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -596,6 +612,34 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+
+        if trace_end is not None:
+            trace_end.record()
+            if self.uses_mrope:
+                trace_positions = self.mrope_positions[0, :num_tokens]
+            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+                trace_positions = self.xdrope_positions[0, :num_tokens]
+            else:
+                trace_positions = self.positions[:num_tokens]
+            rejected = (
+                num_rejected_tokens_gpu[:batch_size].clone()
+                if num_rejected_tokens_gpu is not None
+                else torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+            )
+            query_lens = (
+                common_attn_metadata.query_start_loc_cpu[1:]
+                - common_attn_metadata.query_start_loc_cpu[:-1]
+            )
+            self._moe_activation_snapshot = {
+                "expert_ids": self._moe_activation_capturer.snapshot(num_tokens),
+                "token_ids": self.input_ids[:num_tokens].clone(),
+                "positions": trace_positions.clone(),
+                "query_lens": query_lens.tolist(),
+                "num_rejected": rejected,
+                "start_event": trace_start,
+                "end_event": trace_end,
+                "max_sequence_length": int(common_attn_metadata.max_seq_len),
+            }
 
         # After step 0: switch to reuse mode so steps 1+ skip the indexer
         # and read the indices that step 0 just wrote into the shared buffer.
